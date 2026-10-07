@@ -1,0 +1,441 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ============================================================================
+// SOURCE DATA MODELS
+// ============================================================================
+
+model LegacyCustomer {
+  id                   Int     @id @default(autoincrement())
+  legacy_customer_id   Int     @unique
+  full_name            String
+  email_address        String
+  phone                String?
+  customer_status      String
+  signup_date          String
+  city                 String?
+  country_code         String
+  marketing_opt_in     String?
+  credit_limit         String?
+  
+  createdAt            DateTime @default(now())
+  
+  // Relations
+  migrationRecords     MigrationRecord[]
+  quarantinedRecords   QuarantinedRecord[]
+  
+  @@map("legacy_customers")
+}
+
+// ============================================================================
+// TARGET DATA MODELS
+// ============================================================================
+
+model CustomerMaster {
+  id                      Int     @id
+  first_name              String
+  last_name               String
+  email                   String
+  phone_number            String?
+  active                  Boolean
+  registered_at           DateTime
+  city                    String?
+  country_code            String
+  marketing_opt_in        Boolean
+  credit_limit            Decimal
+  
+  source_record_id        Int     // Track which source record was migrated
+  migration_run_id        String  // Track which migration run inserted this
+  migration_plan_version_id String // Track plan version
+  
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+  
+  // Relations
+  migrationRun            MigrationRun @relation(fields: [migration_run_id], references: [id], onDelete: Cascade)
+  
+  @@unique([source_record_id, migration_run_id])
+  @@map("customer_master")
+}
+
+// ============================================================================
+// MIGRATION PLANNING & EXECUTION MODELS
+// ============================================================================
+
+model MigrationPlan {
+  id                   String     @id @default(cuid())
+  name                 String
+  description          String?
+  source_table         String     // "legacy_customers"
+  target_table         String     // "customer_master"
+  max_records          Int        @default(100)
+  current_version_id   String?
+  
+  status               PlanStatus @default(DRAFT)
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+  
+  // Relations
+  versions             MigrationPlanVersion[]
+  runs                 MigrationRun[]
+  events               MigrationEvent[]
+  
+  @@map("migration_plans")
+}
+
+enum PlanStatus {
+  DRAFT
+  READY_FOR_REVIEW
+  APPROVED
+  DRY_RUN_COMPLETED
+  EXECUTABLE
+  EXECUTED
+  ROLLED_BACK
+}
+
+model MigrationPlanVersion {
+  id                      String     @id @default(cuid())
+  plan_id                 String
+  version_number          Int
+  status                  VersionStatus @default(DRAFT)
+  
+  // Content
+  mappings                FieldMapping[]
+  risks                   MigrationRisk[]
+  clarification_questions ClarificationQuestion[]
+  confidence_summary      Float?      // Average confidence
+  planner_notes           String?
+  
+  // Approval tracking
+  approved_at             DateTime?
+  approved_by             String?     // User identifier, optional for demo
+  approval_notes          String?
+  
+  createdAt               DateTime   @default(now())
+  updated_at              DateTime   @updatedAt
+  
+  // Relations
+  plan                    MigrationPlan @relation(fields: [plan_id], references: [id], onDelete: Cascade)
+  migrationRuns           MigrationRun[]
+  
+  @@unique([plan_id, version_number])
+  @@map("migration_plan_versions")
+}
+
+enum VersionStatus {
+  DRAFT
+  READY_FOR_REVIEW
+  APPROVED
+  DEPRECATED
+}
+
+model FieldMapping {
+  id                      String     @id @default(cuid())
+  plan_version_id         String
+  
+  // Mapping definition
+  source_field            String
+  target_field            String
+  source_type             String
+  target_type             String
+  
+  // Transformation
+  transformations         String[]   // Array of transformation rule IDs
+  is_required             Boolean    @default(true)
+  is_computed             Boolean    @default(false)
+  
+  // Quality metrics
+  confidence              Float      // 0 to 1
+  confidence_level        ConfidenceLevel
+  risk_level              RiskLevel  @default(LOW)
+  
+  // Explanation
+  explanation             String?
+  
+  createdAt               DateTime   @default(now())
+  
+  // Relations
+  planVersion             MigrationPlanVersion @relation(fields: [plan_version_id], references: [id], onDelete: Cascade)
+  
+  @@map("field_mappings")
+}
+
+enum ConfidenceLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model MigrationRisk {
+  id                      String     @id @default(cuid())
+  plan_version_id         String
+  
+  risk_type               String     // e.g., "TYPE_MISMATCH", "MISSING_FIELD", "DATA_LOSS"
+  description             String
+  affected_field          String?
+  recommendation          String?
+  severity                RiskLevel
+  
+  createdAt               DateTime   @default(now())
+  
+  // Relations
+  planVersion             MigrationPlanVersion @relation(fields: [plan_version_id], references: [id], onDelete: Cascade)
+  
+  @@map("migration_risks")
+}
+
+model ClarificationQuestion {
+  id                      String     @id @default(cuid())
+  plan_version_id         String
+  
+  question                String
+  suggested_answer        String?
+  answered_by             String?
+  answer                  String?
+  asked_at                DateTime   @default(now())
+  answered_at             DateTime?
+  
+  // Relations
+  planVersion             MigrationPlanVersion @relation(fields: [plan_version_id], references: [id], onDelete: Cascade)
+  
+  @@map("clarification_questions")
+}
+
+// ============================================================================
+// EXECUTION MODELS
+// ============================================================================
+
+model MigrationRun {
+  id                      String     @id @default(cuid())
+  plan_id                 String
+  plan_version_id         String
+  
+  status                  RunStatus  @default(INITIALIZED)
+  
+  // Counts
+  source_record_count     Int        @default(0)
+  transformed_count       Int        @default(0)
+  accepted_count          Int        @default(0)
+  rejected_count          Int        @default(0)
+  inserted_count          Int        @default(0)
+  skipped_duplicate_count Int        @default(0)
+  
+  // Execution
+  dry_run_started_at      DateTime?
+  dry_run_completed_at    DateTime?
+  execution_started_at    DateTime?
+  execution_completed_at  DateTime?
+  rollback_started_at     DateTime?
+  rollback_completed_at   DateTime?
+  
+  // Tracking
+  retry_count             Int        @default(0)
+  last_retry_at           DateTime?
+  
+  createdAt               DateTime   @default(now())
+  updatedAt               DateTime   @updatedAt
+  
+  // Relations
+  plan                    MigrationPlan @relation(fields: [plan_id], references: [id], onDelete: Cascade)
+  planVersion             MigrationPlanVersion @relation(fields: [plan_version_id], references: [id])
+  records                 MigrationRecord[]
+  quarantined             QuarantinedRecord[]
+  target_records          CustomerMaster[]
+  reconciliation          ReconciliationResult?
+  events                  MigrationEvent[]
+  
+  @@map("migration_runs")
+}
+
+enum RunStatus {
+  INITIALIZED
+  DRY_RUN_IN_PROGRESS
+  DRY_RUN_COMPLETED
+  READY_FOR_EXECUTION
+  EXECUTION_IN_PROGRESS
+  EXECUTION_COMPLETED
+  ROLLBACK_IN_PROGRESS
+  ROLLBACK_COMPLETED
+  FAILED
+}
+
+model MigrationRecord {
+  id                      String     @id @default(cuid())
+  migration_run_id        String
+  source_legacy_customer_id Int
+  
+  status                  RecordStatus @default(PENDING)
+  
+  // Source data
+  source_data             Json       // Original source record
+  
+  // Transformed data
+  transformed_data        Json?      // After transformations
+  validation_errors       Json?      // Field-level errors
+  
+  // Outcome
+  accepted_at             DateTime?
+  rejected_at             DateTime?
+  error_message           String?
+  
+  createdAt               DateTime   @default(now())
+  
+  // Relations
+  migrationRun            MigrationRun @relation(fields: [migration_run_id], references: [id], onDelete: Cascade)
+  sourceRecord            LegacyCustomer @relation(fields: [source_legacy_customer_id], references: [legacy_customer_id])
+  
+  @@unique([migration_run_id, source_legacy_customer_id])
+  @@map("migration_records")
+}
+
+enum RecordStatus {
+  PENDING
+  TRANSFORMED
+  VALIDATED
+  ACCEPTED
+  REJECTED
+  INSERTED
+}
+
+model QuarantinedRecord {
+  id                      String     @id @default(cuid())
+  migration_run_id        String
+  source_legacy_customer_id Int
+  
+  source_data             Json
+  transformed_data        Json?
+  field_errors            FieldError[]
+  
+  quarantined_at          DateTime   @default(now())
+  reviewed_by             String?
+  review_notes            String?
+  reviewed_at             DateTime?
+  
+  // Relations
+  migrationRun            MigrationRun @relation(fields: [migration_run_id], references: [id], onDelete: Cascade)
+  sourceRecord            LegacyCustomer @relation(fields: [source_legacy_customer_id], references: [legacy_customer_id])
+  
+  @@unique([migration_run_id, source_legacy_customer_id])
+  @@map("quarantined_records")
+}
+
+model FieldError {
+  id                      String     @id @default(cuid())
+  quarantined_record_id   String
+  
+  source_field            String
+  target_field            String
+  value                   String?
+  error_message           String
+  validation_rule         String
+  
+  // Relations
+  quarantinedRecord       QuarantinedRecord @relation(fields: [quarantined_record_id], references: [id], onDelete: Cascade)
+  
+  @@map("field_errors")
+}
+
+// ============================================================================
+// RECONCILIATION & AUDIT
+// ============================================================================
+
+model ReconciliationResult {
+  id                      String     @id @default(cuid())
+  migration_run_id        String     @unique
+  
+  source_count            Int
+  accepted_count          Int
+  rejected_count          Int
+  target_count            Int
+  
+  reconciliation_status   ReconciliationStatus
+  difference              Int
+  
+  executed_at             DateTime   @default(now())
+  
+  // Relations
+  migrationRun            MigrationRun @relation(fields: [migration_run_id], references: [id], onDelete: Cascade)
+  
+  @@map("reconciliation_results")
+}
+
+enum ReconciliationStatus {
+  PASS
+  FAIL
+  WARNING
+}
+
+model MigrationEvent {
+  id                      String     @id @default(cuid())
+  plan_id                 String
+  migration_run_id        String?
+  
+  event_type              EventType
+  description             String
+  metadata                Json?
+  
+  created_at              DateTime   @default(now())
+  
+  // Relations
+  plan                    MigrationPlan @relation(fields: [plan_id], references: [id], onDelete: Cascade)
+  
+  @@map("migration_events")
+}
+
+enum EventType {
+  PLAN_CREATED
+  PLAN_VERSION_CREATED
+  PLAN_APPROVED
+  PLAN_REJECTED
+  DRY_RUN_STARTED
+  DRY_RUN_COMPLETED
+  RECORD_QUARANTINED
+  MIGRATION_EXECUTION_STARTED
+  MIGRATION_EXECUTION_COMPLETED
+  MIGRATION_RETRY_STARTED
+  DUPLICATE_SKIPPED
+  RECONCILIATION_COMPLETED
+  ROLLBACK_STARTED
+  ROLLBACK_COMPLETED
+}
+
+// ============================================================================
+// TRANSFORMATION REGISTRY
+// ============================================================================
+
+model TransformationRule {
+  id                      String     @id @default(cuid())
+  
+  rule_id                 String     @unique // e.g., "SPLIT_FULL_NAME"
+  name                    String
+  description             String
+  category                String     // "string", "date", "number", "boolean"
+  
+  supported_source_types  String[]   // e.g., ["string", "varchar"]
+  supported_target_types  String[]   // e.g., ["string"]
+  
+  implementation_code     String     // For reference only, deterministic function
+  is_chainable            Boolean    @default(true)
+  
+  examples                Json?      // Example input/output
+  
+  createdAt               DateTime   @default(now())
+  
+  @@map("transformation_rules")
+}
